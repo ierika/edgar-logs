@@ -1,6 +1,5 @@
 # Edgar Logs Sessionizer
 
------
 ## Tasks
 1. Organize the log file and load it into a database
 2. Sessionize the log by user. A session lasts about 30 minutes.
@@ -8,8 +7,7 @@
    1. Get the top 10 sessions by download count
    2. Get the top 10 sessions by download size
 
-
----
+   
 ## Directory structure
 
 ```                                                                                                                                         git:main*
@@ -40,13 +38,11 @@
 
 - Python 3
 
----
 ## Installation
 1. Install `Pipenv`. `Pipenv` will be the package manager for this project. `python3 -m pip install pipenv`
 2. On the project root, run `pipenv install`. This will create a new virtual environment for you and will also install the required libraries.
 3. Activate the environment by running `pipenv shell`
 
-----
 
 ## How to execute
 
@@ -61,6 +57,5 @@ If not, ensure that your virtual environment is activated and then open the note
 $ jupyter notebook ProcessData.ipynb
 ```
 
----
 ## Todo
 1. Enhancement: Utilize SQLAlchemy ORM instead of using raw queries
