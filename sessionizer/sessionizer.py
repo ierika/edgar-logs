@@ -29,13 +29,17 @@ logger = logging.getLogger('Sessionize EDGAR Apache Logs')
 
 class Session:
     """
-    Session objects
+    Session
+
+    Holds data pertaining to the particular session.
+    It hold the information regarding the session end time and -
+    how many document downloads had occurred and how large
     """
 
     def __init__(self, ip: str, date: pd.Timestamp) -> None:
         """
-        - Add 30 minutes timedelta to determine `session_end` datetime
-        - Initialize `download_count` to 1
+        Identify the session_end from the `date` supplied
+        Instantiate the download size and count
         """
         self.ip = ip
         self.session_start = date
@@ -49,13 +53,21 @@ class Session:
     def add_record(self, size: int) -> None:
         """
         Add value to the `download_size` and increment `download_count` by 1
+
+        :param size: Download size
+        :return: None
         """
         self.download_size += size
         self.download_count += 1
 
 
-def reset_session_table(con: sqlite3.Connection) -> None:
-    """Reset session table"""
+def reset_session_table(con: sqlalchemy.engine.Connection) -> None:
+    """
+    Resets `session` table
+
+    :param con: SqlAlchemy Connection object
+    :return: None
+    """
     con.execute(f'DROP TABLE IF EXISTS {SESSION_TABLE}')
     con.execute(f"""
                 CREATE TABLE {SESSION_TABLE} (
@@ -73,9 +85,14 @@ def record_sessions(con: sqlalchemy.engine.Connection,
                     session_list: List[Session],
                     retry_limit: int) -> None:
     """
-    Clean sessions dictionary out of expired sessions
-    The sessions however must be recorded to the database before deletion
+    Record the list of sessions into the database in batch
+
+    :param con: Sqlalchemy connection
+    :param session_list: Array of Session objects
+    :param retry_limit: Database retry limit in case of operation errors
+    :return: None
     """
+
     if session_list:
         logger.info('Recording %s expired session(s)', len(session_list))
 
@@ -103,7 +120,7 @@ def record_sessions(con: sqlalchemy.engine.Connection,
         # noinspection PyUnresolvedReferences
         con.connection.executemany(query, iterparams())
 
-        # Retry if database has locked out
+        # Retry in case of db operational errors
         retry_counter = 0
         while True:
             retry_counter += 1
@@ -111,11 +128,8 @@ def record_sessions(con: sqlalchemy.engine.Connection,
                 con.connection.commit()
                 break
             except sqlite3.OperationalError as e:
-                # Raise exception if retry limit has been exceeded
                 if retry_counter == retry_limit:
                     raise e
-
-                # Otherwise, delay a bit and continue
                 time.sleep(1)
                 continue
 
@@ -123,17 +137,25 @@ def record_sessions(con: sqlalchemy.engine.Connection,
         session_list.clear()
 
 
-def sessionize(chunksize: int = 1000000,
-               limit: Tuple[int, int] = None,
+def sessionize(chunksize: int = 1000000,  # 1 mil rows per chunk
+               limit: Tuple[int, int] or None = None,
                retry_limit: int = 5,
                executemany_limit: int = 1000) -> None:
     """
     Sessionize log file
 
     1. Connect to db.sqlite3 database and read the data chunk by chunk
-    2. Process logs into their respective sessions
-    3. Write the session information into the database for further analysis
+    2. Process logs and record them into their respective sessions
+    3. Record the sessions as they expire. (writes in batch to reduce I/O)
+    4. Finally, record all unfinished sessions at the end of the process.
+
+    :param chunksize: How many rows you want to process at a time
+    :param limit: It will add `LIMIT n, n` to the SQL query
+    :param retry_limit: Maximum of retries for when we encounter a database related exception
+    :param executemany_limit: Maximum number of batch writes to the DB
+    :return: None
     """
+
     # Dictionary containing all the sessions
     sessions_dict = dict()
 
@@ -164,7 +186,6 @@ def sessionize(chunksize: int = 1000000,
                                        index_col='id',
                                        parse_dates=['date'])
 
-        # Iterate through log chunks
         for chunk_number, log_df in enumerate(log_reader, start=1):
             logger.info('Reading chunk number %s of the log table', chunk_number)
 
@@ -174,8 +195,8 @@ def sessionize(chunksize: int = 1000000,
             log_df['is_download'] = is_valid_code & is_not_idx
 
             for _, row in log_df.iterrows():
-                # Housekeeping - record expired sessions to the database
-                # We will only do it if reaches a certain threshold
+                # Housekeeping - Record expired sessions to the database -
+                # when it reaches a certain threshold
                 expired_sessions_count = len(expired_sessions)
                 if expired_sessions_count >= executemany_limit:
                     record_sessions(con=con,
@@ -183,11 +204,10 @@ def sessionize(chunksize: int = 1000000,
                                     retry_limit=retry_limit)
 
                 try:
-                    # Get existing session
+                    # Get and update session -
+                    # If the session has expired, create a new one
                     session = sessions_dict[row['ip']]
 
-                    # Update session is expired, re-establish session and -
-                    # move the old one to the session_list bucket
                     if session.session_end < row['date']:
                         expired_sessions.append(session)
                         session = Session(ip=row['ip'], date=row['date'])
@@ -195,8 +215,6 @@ def sessionize(chunksize: int = 1000000,
                             session.add_record(size=row['size'])
                         sessions_dict[row['ip']] = session
                         logger.debug('Re-established session => %s', session)
-
-                    # Update existing session if still valid
                     else:
                         if row['is_download']:
                             session.add_record(size=row['size'])
@@ -219,8 +237,5 @@ def sessionize(chunksize: int = 1000000,
 
 
 if __name__ == '__main__':
-    """
-    Supply `sessionizer` with the location of the log file
-    """
     # TODO: Take in arguments from CLI
     sessionize()
