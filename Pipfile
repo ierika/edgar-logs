@@ -8,6 +8,8 @@ requests = "*"
 pandas = "*"
 dask = "*"
 sqlalchemy = "*"
+matplotlib = "*"
+jupyter = "*"
 
 [dev-packages]
 
