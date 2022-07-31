@@ -116,7 +116,6 @@ def record_sessions(con: sqlalchemy.engine.Connection,
                 ) VALUES (?, ?, ?, ?, ?)
                 """
 
-        logger.info('Recording %s session(s)', len(session_list))
         # noinspection PyUnresolvedReferences
         con.connection.executemany(query, iterparams())
 
@@ -186,6 +185,10 @@ def sessionize(chunksize: int = 1000000,  # 1 mil rows per chunk
                                        index_col='id',
                                        parse_dates=['date'])
 
+        # Record the latest log date so we can clean up the sessions_dict -
+        # after every chunk, so it doesn't accumulate so much in the memory
+        latest_log_date = None
+
         for chunk_number, log_df in enumerate(log_reader, start=1):
             logger.info('Reading chunk number %s of the log table', chunk_number)
 
@@ -195,6 +198,8 @@ def sessionize(chunksize: int = 1000000,  # 1 mil rows per chunk
             log_df['is_download'] = is_valid_code & is_not_idx
 
             for _, row in log_df.iterrows():
+                latest_log_date = row['date']
+
                 # Housekeeping - Record expired sessions to the database -
                 # when it reaches a certain threshold
                 expired_sessions_count = len(expired_sessions)
@@ -211,22 +216,24 @@ def sessionize(chunksize: int = 1000000,  # 1 mil rows per chunk
                     if session.session_end < row['date']:
                         expired_sessions.append(session)
                         session = Session(ip=row['ip'], date=row['date'])
-                        if row['is_download']:
-                            session.add_record(size=row['size'])
                         sessions_dict[row['ip']] = session
                         logger.debug('Re-established session => %s', session)
-                    else:
-                        if row['is_download']:
-                            session.add_record(size=row['size'])
-                            logger.debug('Added a record to an existing session: %s', session)
 
                 except KeyError:
                     # Create new session
                     session = Session(ip=row['ip'], date=row['date'])
-                    if row['is_download']:
-                        session.add_record(size=row['size'])
                     sessions_dict[session.ip] = session
                     logger.debug('Created a new session => %s', session)
+
+                if row['is_download']:
+                    session.add_record(size=row['size'])
+                    logger.debug('Added record to => %s', session)
+
+            # Check for expired sessions for every chunk
+            for ip, session in sessions_dict.copy().items():
+                if session.session_end < latest_log_date:
+                    expired_sessions.append(session)
+                    del sessions_dict[ip]
 
         # Finally, make sure all the unfinished sessions at the end of the process gets recorded
         record_sessions(con=con,
