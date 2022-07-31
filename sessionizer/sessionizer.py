@@ -1,7 +1,8 @@
 import logging
 import sqlite3
+import time
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import List, Tuple
 
 import pandas as pd
 import sqlalchemy.engine
@@ -30,7 +31,8 @@ class Session:
     """
     Session objects
     """
-    def __init__(self, ip: str, date: pd.Timestamp, size: int) -> None:
+
+    def __init__(self, ip: str, date: pd.Timestamp) -> None:
         """
         - Add 30 minutes timedelta to determine `session_end` datetime
         - Initialize `download_count` to 1
@@ -38,22 +40,22 @@ class Session:
         self.ip = ip
         self.session_start = date
         self.session_end = self.session_start + pd.Timedelta('30 minutes')
-        self.download_size = size
-        self.download_count = 1
+        self.download_size = 0
+        self.download_count = 0
 
     def __str__(self) -> str:
         return f'Session({self.ip} = {self.session_start} - {self.session_end})'
 
-    def add_record(self, ip: str, size: int) -> None:
+    def add_record(self, size: int) -> None:
         """
         Add value to the `download_size` and increment `download_count` by 1
         """
-        assert ip == self.ip
         self.download_size += size
         self.download_count += 1
 
 
 def reset_session_table(con: sqlite3.Connection) -> None:
+    """Reset session table"""
     con.execute(f'DROP TABLE IF EXISTS {SESSION_TABLE}')
     con.execute(f"""
                 CREATE TABLE {SESSION_TABLE} (
@@ -67,31 +69,16 @@ def reset_session_table(con: sqlite3.Connection) -> None:
                 """)
 
 
-def clean_sessions_dict(con: sqlalchemy.engine.Connection,
-                        latest_date: pd.Timestamp,
-                        sessions_dict: Dict[str, Session]) -> None:
+def record_sessions(con: sqlalchemy.engine.Connection,
+                    session_list: List[Session],
+                    retry_limit: int) -> None:
     """
     Clean sessions dictionary out of expired sessions
     The sessions however must be recorded to the database before deletion
     """
-    sessions_to_write = []
-    for ip, session in sessions_dict.items():
-        if session.session_end < latest_date:
-            sessions_to_write.append(session)
-
-    if sessions_to_write:
-        query = f"""
-        INSERT INTO {SESSION_TABLE} (
-              ip
-            , session_start
-            , session_end
-            , download_size
-            , download_count
-        ) VALUES (?, ?, ?, ?, ?)
-        """
-
+    if session_list:
         def iterparams():
-            for s in sessions_to_write:
+            for s in session_list:
                 yield (
                     s.ip,
                     s.session_start.strftime('%Y-%m-%d %H:%M:%S'),
@@ -100,16 +87,44 @@ def clean_sessions_dict(con: sqlalchemy.engine.Connection,
                     s.download_count,
                 )
 
-        logger.info('Recording %s session(s)', len(sessions_to_write))
+        query = f"""
+                INSERT INTO {SESSION_TABLE} (
+                      ip
+                    , session_start
+                    , session_end
+                    , download_size
+                    , download_count
+                ) VALUES (?, ?, ?, ?, ?)
+                """
+
+        logger.info('Recording %s session(s)', len(session_list))
+        # noinspection PyUnresolvedReferences
         con.connection.executemany(query, iterparams())
-        con.connection.commit()
 
-        # Delete sessions from sessions_dict
-        for session in sessions_to_write:
-            del sessions_dict[session.ip]
+        # Retry if database has locked out
+        retry_counter = 0
+        while True:
+            retry_counter += 1
+            try:
+                con.connection.commit()
+                break
+            except sqlite3.OperationalError as e:
+                # Raise exception if retry limit has been exceeded
+                if retry_counter == retry_limit:
+                    raise e
+
+                # Otherwise, delay a bit and continue
+                time.sleep(1)
+                continue
+
+        # Empty the `session_list` list
+        session_list.clear()
 
 
-def sessionize(chunksize: int = 1000000, limit: Tuple[int, int] = None) -> None:
+def sessionize(chunksize: int = 1000000,
+               limit: Tuple[int, int] = None,
+               retry_limit: int = 5,
+               executemany_limit: int = 1000) -> None:
     """
     Sessionize log file
 
@@ -117,8 +132,11 @@ def sessionize(chunksize: int = 1000000, limit: Tuple[int, int] = None) -> None:
     2. Process logs into their respective sessions
     3. Write the session information into the database for further analysis
     """
-    # Class containing the sessions
+    # Dictionary containing all the sessions
     sessions_dict = dict()
+
+    # We accumulate the expired sessions here for batch processing
+    expired_sessions = []
 
     engine = create_engine(DB_CONNECTION_STR)
     with engine.begin() as con:
@@ -130,35 +148,71 @@ def sessionize(chunksize: int = 1000000, limit: Tuple[int, int] = None) -> None:
 
         # We need to anticipate that the logs may be randomly ordered
         # Hence, we should explicitly include ORDER BY to the query
-        # Make a connection to the db.sqlite3 database
-        query = f'SELECT * FROM {LOG_TABLE} ORDER BY date'
+        query = f"""
+        SELECT id, ip, date, size, idx, code
+        FROM {LOG_TABLE}
+        ORDER BY date
+        """
         if limit:
             query = query + f' LIMIT {limit[0]}, {limit[1]}'
 
         log_reader = pd.read_sql_query(query,
                                        con=con,
                                        chunksize=chunksize,
+                                       index_col='id',
                                        parse_dates=['date'])
 
         # Iterate through log chunks
         for chunk_number, log_df in enumerate(log_reader, start=1):
             logger.info('Reading chunk number %s of the log table', chunk_number)
 
+            # Flag the valid downloads
+            is_valid_code = (log_df['code'] >= 200) & (log_df['code'] < 400)
+            is_not_idx = log_df['idx'] == 0
+            log_df['is_download'] = is_valid_code & is_not_idx
+
             for _, row in log_df.iterrows():
-                # Do some housekeeping on `session_dict` to rid of expired sessions
-                clean_sessions_dict(con=con, latest_date=row['date'], sessions_dict=sessions_dict)
+                # Housekeeping - record expired sessions to the database
+                # We will only do it if reaches a certain threshold
+                expired_sessions_count = len(expired_sessions)
+                if expired_sessions_count >= executemany_limit:
+                    logger.info('Recording %s expired session(s)', expired_sessions_count)
+                    record_sessions(con=con,
+                                    session_list=expired_sessions,
+                                    retry_limit=retry_limit)
 
                 try:
-                    # Update existing session
+                    # Get existing session
                     session = sessions_dict[row['ip']]
-                    session.add_record(ip=row['ip'], size=row['size'])
-                    logger.info('Added a record to an existing session: %s', str(session))
+
+                    # Update session is expired, re-establish session and -
+                    # move the old one to the session_list bucket
+                    if session.session_end < row['date']:
+                        expired_sessions.append(session)
+                        session = Session(ip=row['ip'], date=row['date'])
+                        if row['is_download']:
+                            session.add_record(size=row['size'])
+                        sessions_dict[row['ip']] = session
+                        logger.info('Re-established session => %s', session)
+
+                    # Update existing session if still valid
+                    else:
+                        if row['is_download']:
+                            session.add_record(size=row['size'])
+                            logger.info('Added a record to an existing session: %s', session)
 
                 except KeyError:
-                    # Create session
-                    session = Session(ip=row['ip'], date=row['date'], size=row['size'])
+                    # Create new session
+                    session = Session(ip=row['ip'], date=row['date'])
+                    if row['is_download']:
+                        session.add_record(size=row['size'])
                     sessions_dict[session.ip] = session
                     logger.info('Created a new session => %s', session)
+
+        # Finally, make sure all the unfinished sessions at the end of the process gets recorded
+        record_sessions(con=con,
+                        session_list=list(sessions_dict.values()),
+                        retry_limit=retry_limit)
 
         logger.info('Sessionization complete!')
 
@@ -167,4 +221,5 @@ if __name__ == '__main__':
     """
     Supply `sessionizer` with the location of the log file
     """
+    # TODO: Take in arguments from CLI
     sessionize()
