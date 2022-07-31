@@ -1,4 +1,4 @@
-# Edgar Logs Sessionizer
+# EDGAR Logs Sessionizer
 
 ## Tasks
 1. Organize the log file and load it into a database
@@ -6,6 +6,16 @@
 3. Analyze the data
    1. Get the top 10 sessions by download count
    2. Get the top 10 sessions by download size
+
+**Sessions**
+
+Sessions are calculated in 30 minute intervals per user (IP address).
+All user activities are accounted for calculating sessions, even in the event of an unsuccessful request (e.g. HTTP 404 Not Found)
+
+**Downloads**
+
+- HTTP requests that are non-erroneous (e.g. `2xx` ~ `3xx`)
+- Requests that are NOT flagged as an index page `idx == 0`. Note: `idx` with the value of `1` is an index page.
 
    
 ## Directory structure
@@ -59,3 +69,5 @@ $ jupyter notebook ProcessData.ipynb
 
 ## Todo
 1. Enhancement: Utilize SQLAlchemy ORM instead of using raw queries
+2. Parameterize sessionizer.py during standalone execution
+3. Optional: Try to analyze the logs using purely SQL. Chances are, it is going to improve the performance significantly.
