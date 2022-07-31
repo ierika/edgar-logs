@@ -77,6 +77,8 @@ def record_sessions(con: sqlalchemy.engine.Connection,
     The sessions however must be recorded to the database before deletion
     """
     if session_list:
+        logger.info('Recording %s expired session(s)', len(session_list))
+
         def iterparams():
             for s in session_list:
                 yield (
@@ -176,7 +178,6 @@ def sessionize(chunksize: int = 1000000,
                 # We will only do it if reaches a certain threshold
                 expired_sessions_count = len(expired_sessions)
                 if expired_sessions_count >= executemany_limit:
-                    logger.info('Recording %s expired session(s)', expired_sessions_count)
                     record_sessions(con=con,
                                     session_list=expired_sessions,
                                     retry_limit=retry_limit)
@@ -193,13 +194,13 @@ def sessionize(chunksize: int = 1000000,
                         if row['is_download']:
                             session.add_record(size=row['size'])
                         sessions_dict[row['ip']] = session
-                        logger.info('Re-established session => %s', session)
+                        logger.debug('Re-established session => %s', session)
 
                     # Update existing session if still valid
                     else:
                         if row['is_download']:
                             session.add_record(size=row['size'])
-                            logger.info('Added a record to an existing session: %s', session)
+                            logger.debug('Added a record to an existing session: %s', session)
 
                 except KeyError:
                     # Create new session
@@ -207,7 +208,7 @@ def sessionize(chunksize: int = 1000000,
                     if row['is_download']:
                         session.add_record(size=row['size'])
                     sessions_dict[session.ip] = session
-                    logger.info('Created a new session => %s', session)
+                    logger.debug('Created a new session => %s', session)
 
         # Finally, make sure all the unfinished sessions at the end of the process gets recorded
         record_sessions(con=con,
